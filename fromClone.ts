@@ -1,102 +1,81 @@
-import simpleGit, { SimpleGit } from 'simple-git';
+import simpleGit, { SimpleGit, LogResult } from 'simple-git';
 import { promises as fs } from 'fs';
 const git = simpleGit();
 const repoUrl = 'https://github.com/Opentrons/opentrons.git';
-const localPath = './opentrons_repo';
-
+const localPath = 'opentrons_repo';
 
 async function checkDirectoryExists(directoryPath: string): Promise<boolean> {
   try {
-    const stats = await fs.stat(directoryPath);
-    return stats.isDirectory();
-  } catch (error: any) {
-    if (error.code === 'ENOENT') { // ENOENT is the error code for 'No such file or directory'
-      return false;
-    }
-    throw error; // Rethrow unexpected errors
+    await fs.access(directoryPath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-async function cloneAndFetchTags(repoUrl: string, localPath: string): Promise<SimpleGit> {
-
-  let repoGit: SimpleGit = simpleGit();
+async function cloneAndFetch(repoUrl: string, localPath: string): Promise<SimpleGit> {
   if (!await checkDirectoryExists(localPath)) {
-
-    // Capture the start time for cloning
-    const cloneStartTime = Date.now();
-
-    // Clone the repository
-    console.log(`Cloning ${repoUrl}...`);
-    await git.clone(repoUrl, localPath);
-    console.log(`Repository shallow cloned to ${localPath}`);
-
-    // Calculate and print the cloning time in seconds
-    const cloneEndTime = Date.now();
-    console.log(`Cloning Time: ${((cloneEndTime - cloneStartTime) / 1000).toFixed(2)} seconds`);
-
-    // Change working directory to the cloned repo
-    repoGit = simpleGit(localPath);
+    console.log(`Cloning ${repoUrl} into ${localPath}...`);
+    await git.clone(repoUrl, localPath); // Use the general instance to clone
+    console.log(`Repository cloned to ${localPath}.`);
   }
-  else {
-    repoGit = simpleGit(localPath);
-    repoGit.fetch(['--all'])
-  }
-  console.log('Fetching tags...');
-  // Capture the start time for fetching tags
-  const fetchStartTime = Date.now();
-  await repoGit.fetch(['--tags']);
-  // Calculate and print the fetching time in seconds
-  const fetchEndTime = Date.now();
-  console.log('Tags fetched.');
-  console.log(`Fetching Tags Time: ${((fetchEndTime - fetchStartTime) / 1000).toFixed(2)} seconds`);
+  const repoGit: SimpleGit  = simpleGit(localPath); // Use the specific instance to work with the cloned repo
+  console.log('Fetching all and tags...');
+  await repoGit.fetch('--all'); // Fetch all branches
+  await repoGit.fetch('--tags'); // Fetch all tags
+  console.log('Fetched.');
   return repoGit;
 }
 
 
-interface LocalTagDetails {
-  name: string;
-  date: string;
+interface CommitDetails {
   sha: string;
+  date: string; // ISO format for easy sorting
 }
 
-async function getLocalTagDetails(tagName: string, repoGit: SimpleGit): Promise<LocalTagDetails> {
-  const showData = await repoGit.show(['--name-only', '--format=%H %aI', tagName]);
-  const [sha, date] = showData?.split('\n')[0].split(' ');
-  console.log(`Tag: ${tagName} - SHA: ${sha} - Date: ${date}`);
-  return {
-    name: tagName,
-    date: date || '2007-10-29T02:42:39.000-07:00', // Default date if not found
-    sha,
-  };
+interface TagDetails {
+  name: string;
+  sha: string;
+  date: string;
+}
+
+async function fetchRecentCommits(repoGit: SimpleGit, maxCommits: number = 3500): Promise<CommitDetails[]> {
+  const log: LogResult = await repoGit.log({ '--max-count': maxCommits });
+  return log.all.map(commit => ({
+    sha: commit.hash,
+    date: commit.date // The date is in ISO format by default
+  }));
+}
+
+async function fetchTagsForCommits(repoGit: SimpleGit, commits: CommitDetails[]): Promise<TagDetails[]> {
+  const tagsRef = await repoGit.raw(['show-ref', '--tags']);
+  const allTags = tagsRef.split('\n').filter(line => !!line).map(line => {
+    const [sha, ref] = line.split(' ');
+    const name = ref.replace('refs/tags/', '');
+    return { name, sha };
+  });
+
+  const tagsWithDate: TagDetails[] = [];
+  for (const commit of commits) {
+    const tagsForCommit = allTags.filter(tag => tag.sha.startsWith(commit.sha));
+    tagsForCommit.forEach(tag => {
+      tagsWithDate.push({ ...tag, date: commit.date });
+    });
+  }
+
+  return tagsWithDate;
 }
 
 async function main() {
-  try {
-    // Clone the repository and fetch tags
-    const repoGit = await cloneAndFetchTags(repoUrl, localPath);
-    // get all tags
-    const tags = await repoGit.tags();
-    const tagCategories = ['ot3', 'v', 'docs', 'components', 'protocol-designer'];
-    let filteredTags: string[] = [];
+  const repoGit = await cloneAndFetch(repoUrl, localPath)
+  const recentCommits = await fetchRecentCommits(repoGit);
+  const tags = await fetchTagsForCommits(repoGit, recentCommits);
 
-    for (const category of tagCategories) {
-      // Filter tags for the current category
-      const categoryTags = tags.all.filter(tagName => tagName.startsWith(category));
-      filteredTags = filteredTags.concat(categoryTags);
-    }
+  // Now you have tags with dates, and you can sort them as needed
+  const sortedTags = tags.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    // Fetch details for filtered tags
-    const tagDetailsPromises = filteredTags.map(tagName => getLocalTagDetails(tagName, repoGit!));
-    let tagDetails = await Promise.all(tagDetailsPromises);
-
-    // Print the first 10 tags for the current category by date most recent first
-    tagDetails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-    //console.log('First 10 Tags by date most recent first:');
-    //tagDetails.slice(0, 10).forEach(tag => console.log(`${tag.name} - SHA: ${tag.sha} - Date: ${tag.date}`));
-
-  } catch (error) {
-    console.error(`Error processing tags: ${error}`);
-  }
+  // print the last 10 sorted tags
+  console.log(sortedTags.slice(0, 10));
 }
 
 main();
