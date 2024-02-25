@@ -74,7 +74,7 @@ async function fetchTagDetails(tag: Tag): Promise<TagDetails> {
         });
         return {
             name: tag.name,
-            date: commitObj.commit.author ? commitObj.commit.author.date || '' : '',
+            date: commitObj.commit.author?.date || '2007-10-29T02:42:39.000-07:00',
             sha: tag.commit.sha,
         };
     } catch (error) {
@@ -88,19 +88,17 @@ async function main() {
     try {
         const allTags = await getAllTags('Opentrons', 'opentrons', true);
         const tagCategories = ['ot3', 'v', 'docs', 'components', 'protocol-designer'];
-        const categorySize = 5;
         let filteredTags: Tag[] = [];
 
         for (const category of tagCategories) {
             // Filter tags for the current category and take the first 10
             const firstTags = allTags
                 .filter(tag => tag.name.startsWith(category))
-                .slice(0, categorySize); // Assuming the tags are already in the desired order
 
             // Print the first 10 tags for the current category
-            console.log(`First ${categorySize} Tags for category '${category}':`);
-            firstTags.forEach(tag => console.log(`${tag.name} - SHA: ${tag.commit.sha}`));
-            console.log('-------------------');
+            // console.log(`First ${categorySize} Tags for category '${category}':`);
+            // firstTags.forEach(tag => console.log(`${tag.name} - SHA: ${tag.commit.sha}`));
+            // console.log('-------------------');
             firstTags.forEach(tag => filteredTags.push(tag));
         }
 
@@ -127,15 +125,24 @@ async function main() {
         // Sort SHA groups by date in descending order (newest first)
         shaGroups.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-        // Step 4: Print details for each group of tags, now sorted by date
+        const latestShaGroupsByCategory: { [category: string]: typeof shaGroups[number] } = {};
+
+        // Categorize SHA groups and find the latest group for each category
         shaGroups.forEach(group => {
-            console.log(`Tags for SHA ${group.sha}:`);
+            const category = tagCategories.find(category => group.tags[0].name.startsWith(category));
+            if (category && (!latestShaGroupsByCategory[category] || new Date(group.date) > new Date(latestShaGroupsByCategory[category].date))) {
+                latestShaGroupsByCategory[category] = group;
+            }
+        });
+
+        // Print the latest SHA group for each category
+        Object.entries(latestShaGroupsByCategory).forEach(([category, group]) => {
+            console.log(`Latest SHA Group for category '${category}': SHA: ${group.sha} - Date: ${group.date}`);
             group.tags.forEach(tag => {
-                console.log(`- ${tag.name} - Date: ${tag.date} - SHA: ${tag.sha}`);
+                console.log(`- ${tag.name} - SHA: ${tag.sha}`);
             });
             console.log('-------------------');
         });
-
     } catch (error) {
         core.error(`Error fetching tags: ${error}`);
     }

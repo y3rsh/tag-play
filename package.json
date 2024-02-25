@@ -1,11 +1,13 @@
 {
   "scripts": {
     "build": "tsc",
-    "go": "ts-node ./tags.ts"
+    "go": "ts-node ./tags.ts",
+    "go2": "ts-node ./fromClone.ts"
   },
   "dependencies": {
     "@actions/core": "^1.10.1",
-    "@actions/github": "^6.0.0"
+    "@actions/github": "^6.0.0",
+    "simple-git": "^3.22.0"
   },
   "devDependencies": {
     "ts-node": "^10.9.2"
