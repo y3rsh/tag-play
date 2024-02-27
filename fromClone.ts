@@ -1,7 +1,9 @@
-import simpleGit, { SimpleGit, LogResult, BranchSummary, DefaultLogFields, TagResult } from 'simple-git';
+import simpleGit, { SimpleGit, LogResult, BranchSummary, DefaultLogFields, TagResult, ListLogLine } from 'simple-git';
 import { promises as fs } from 'fs';
-import { ExitCode } from '@actions/core';
+import { getOctokit } from '@actions/github';
+import { components } from "@octokit/openapi-types";
 
+type PullRequestData = components["schemas"]["pull-request"];
 
 interface RepoConfig {
   url: string;
@@ -41,34 +43,128 @@ async function checkDirectoryExists(directoryPath: string): Promise<boolean> {
   }
 }
 
-async function printCommitsUntilTagFound(repoGit: SimpleGit, pattern: string): Promise<string | undefined> {
-  // Fetch commits from branches matching the pattern, ensuring they are in date order with from HEAD
-  const commits = await repoGit.log({
-    '--remotes': `origin/${pattern}`,
-    '--pretty': 'format:%H %aI %D',
-  });
-  console.log(`\nPrinting the most recent commits on --remotes origin/${pattern} until a tag is found:`);
+function extractOwnerAndRepo(url: string) {
+  const regex = /https:\/\/github\.com\/([^\/]+)\/([^\/]+)\.git/;
+  const match = url.match(regex);
 
-  // Iterate through commits and print details
-  for (const commit of commits.all) {
-    console.log(`${commit.hash} ${commit.date} ${commit.refs}`);
-
-    // Check if the commit's refs include a tag
-    if (commit.refs && /tag:/.test(commit.refs)) {
-      console.log('\nTag found in commit refs, stopping.');
-      return commit.hash; // Return the commit hash if a tag is found
-    }
+  if (match) {
+    const owner = match[1];
+    const repo = match[2];
+    return { owner, repo };
+  } else {
+    throw new Error('Could not parse GitHub URL');
   }
-  // Return undefined if no tag is found
-  return undefined;
 }
 
+let octokitSingleton: ReturnType<typeof getOctokit>;
 
 
-interface CommitDetails {
-  sha: string;
-  date: string; // ISO format for easy sorting
-  tags: string[]; // Include an array to store tags
+function getOctokitSingleton() {
+  if (!octokitSingleton) {
+    const githubToken = process.env.GT;
+    if (!githubToken) {
+      throw new Error('GitHub token not found');
+    }
+    octokitSingleton = getOctokit(githubToken);
+  }
+  return octokitSingleton;
+}
+
+async function fetchPRDetails(owner: string, repo: string, pullNumber: number): Promise<PullRequestData | null> {
+  const octokit = getOctokitSingleton()
+
+  try {
+    const { data: prData } = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: pullNumber,
+    });
+    return prData;
+    // Here you can add more logics like extracting JIRA IDs
+  } catch (error) {
+    console.error(`Error fetching PR details: ${error}`);
+  }
+  return null;
+}
+
+async function printCommitsWithPRAndJiraLinks(repoGit: SimpleGit, pattern: string, repoUrl: string): Promise<void> {
+
+  const { owner, repo } = extractOwnerAndRepo(repoUrl)
+  const commits = await repoGit.log({
+    '--remotes': `origin/${pattern}`,
+    '--pretty': 'format:%H %aI %D %s',
+    '--max-count': 100, // Limit the number of commits to 100
+  });
+
+  console.log(`\n\nHere are the most recent commits on --remotes origin/${pattern}:`);
+
+  const prRegex = /#(\d+)/;
+  const jiraIdRegex = /([a-zA-Z]+-\d{1,5})/gi;
+  const jiraLinkRegex = /https:\/\/opentrons\.atlassian\.net\/browse\/([A-Z]+-\d+)/gi
+  const jiraBaseUrl = 'https://opentrons.atlassian.net/browse/';
+  const repoBaseUrl = repoUrl.replace('.git', '');
+  let jiraIds: Set<string> = new Set();
+  let jiraLinks: Set<string> = new Set();
+
+
+  const firstCommit = commits.all[0];
+  for (const commit of commits.all) {
+    const prMatch = commit.message.match(prRegex);
+    let prDataFinal: PullRequestData | null = null;
+    if (prMatch) {
+      const prNumber = Number(prMatch[1]);
+      //
+
+      try {
+        const prData: PullRequestData | null = await fetchPRDetails(owner, repo, prNumber);
+        if (prData !== null) {
+          const prBodyJiraIds = prData.body?.match(jiraIdRegex);
+          if (prBodyJiraIds) {
+            prBodyJiraIds.forEach((id: string) => jiraIds.add(id.toUpperCase()));
+          }
+          const prTitleJiraIds = prData.title.match(jiraIdRegex);
+          if (prTitleJiraIds) {
+            prTitleJiraIds.forEach((id: string) => jiraIds.add(id.toUpperCase()));
+          }
+          const prBodyJiraLinks = prData.body?.match(jiraLinkRegex);
+          if (prBodyJiraLinks) {
+            prBodyJiraLinks.forEach((link: string) => jiraLinks.add(link));
+          }
+          prDataFinal = prData;
+        }
+      } catch (error) {
+        console.error(`Error fetching PR details: ${error}`);
+      }
+    }
+    if (commit.refs && /tag:/.test(commit.refs)) {
+      console.log(`\nMost Recent Tag:`)
+      console.log(`\n${commit.hash}\n  ${commit.date}\n  ${commit.refs}\n  ${commit.message}`);
+      console.log(`  PR Link: ${prDataFinal ? prDataFinal.html_url : 'N/A'}`);
+      console.log('_________________________');
+      const diffUrl = `${repoBaseUrl}/compare/${commit.hash}...${firstCommit.hash}`;
+      console.log(`\nView diff since the last tag:\n  ${diffUrl}`);
+      break; // Exit the loop when a tag is found
+    } else {
+      console.log(`\n${commit.hash}\n  ${commit.date}\n  ${commit.refs}\n  ${commit.message}`);
+      console.log(`  PR Link: ${prDataFinal ? prDataFinal.html_url : 'N/A'}`);
+    }
+  }
+
+  // Deduping and printing Jira links
+  // Filter out specific Jira IDs and convert the rest to full URLs
+  let filteredAndConvertedJiraLinks = new Set([...jiraIds]
+    .filter((id): id is string => !["OT-2", "OT-3"].includes(id)) // Exclude specific IDs
+    .map(id => `${jiraBaseUrl}${id}`)); // Convert to URLs
+
+  let combined = new Set([...filteredAndConvertedJiraLinks, ...jiraLinks]);
+  console.log('\nHere are the Jira links associated with the commits:');
+  combined.forEach(link => {
+    console.log(`  Jira Link: ${link}`);
+  });
+  console.log('\nlet us know if you:')
+  console.log('- strongly feel we should cut a new build 🪓');
+  console.log('- strongly feel we should wait ⏳');
+
 }
 
 interface TagCommitDetails {
@@ -160,7 +256,7 @@ async function printLatestTagsByCategory(tagCommits: TagCommitDetails[], tagRege
         const category = match[0];
         // Get the existing array of commits for this category, or initialize a new one
         let existingCommits = mostRecentByCategory.get(category) || [];
-        
+
         // Check if this commit is already included in the category
         if (!existingCommits.some(c => c.sha === commit.sha)) {
           // Add the current commit to the array if not already included
@@ -207,13 +303,10 @@ async function main() {
     const repo = await cloneAndFetch(config.url, config.localPath);
     const recentCommits = await fetchRecentTagCommits(repo);
     await printLatestTagsByCategory(recentCommits, config.tagRegex);
-    if (config.releaseBranchPattern) {
-      const commitWithTag = await printCommitsUntilTagFound(repo, config.releaseBranchPattern);
-      if (commitWithTag) {
-        await printCommitDetails(repo, commitWithTag);
-      }
-    }
     await printLast5TagsWithDetails(repo);
+    if (config.releaseBranchPattern) {
+      await printCommitsWithPRAndJiraLinks(repo, config.releaseBranchPattern, config.url);
+    }
   });
 }
 
