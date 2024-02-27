@@ -5,6 +5,8 @@ import { components } from "@octokit/openapi-types";
 
 type PullRequestData = components["schemas"]["pull-request"];
 
+const CURRENT_RELEASE = '7.2.0'
+
 interface RepoConfig {
   url: string;
   localPath: string;
@@ -13,11 +15,26 @@ interface RepoConfig {
 }
 
 const repoConfigs: RepoConfig[] = [
+  // {
+  //   url: 'https://github.com/Opentrons/ot3-firmware.git',
+  //   localPath: 'ot3-firmware_repo',
+  //   tagRegex: /^(v|internal)/,
+  // },
+  // {
+  //   url: 'https://github.com/Opentrons/oe-core.git',
+  //   localPath: 'oe-core_repo',
+  //   tagRegex: /^(v|internal)/,
+  // },
+  // {
+  //   url: 'https://github.com/Opentrons/buildroot.git',
+  //   localPath: 'buildroot_repo',
+  //   tagRegex: /^(v|internal)/,
+  // },
   {
     url: 'https://github.com/Opentrons/opentrons.git',
     localPath: 'opentrons_repo',
     tagRegex: /^(v|ot3|docs|components|protocol-designer)/,
-    releaseBranchPattern: 'chore_release*',
+    releaseBranchPattern: `chore_release-${CURRENT_RELEASE}`,
   },
 ];
 
@@ -25,7 +42,7 @@ async function cloneAndFetch(repoUrl: string, localPath: string): Promise<Simple
   if (!await checkDirectoryExists(localPath)) {
     console.log(`Cloning ${repoUrl} into ${localPath}...`);
     await simpleGit().clone(repoUrl, localPath);
-    console.log(`Repository cloned to ${localPath}.`);
+    console.log(`\nRepository cloned to ${localPath}.`);
   }
   const repoGit: SimpleGit = simpleGit(localPath); // Use the specific instance to work with the cloned repo
   console.log('Fetching...');
@@ -87,16 +104,72 @@ async function fetchPRDetails(owner: string, repo: string, pullNumber: number): 
   return null;
 }
 
+interface PRApprovalStatus {
+  state: string;
+  reviewer: string;
+}
+
+async function fetchPRApprovalStatus(owner: string, repo: string, pullNumber: number): Promise<PRApprovalStatus[] | null> {
+  const octokit = getOctokitSingleton()
+  const reviews = await octokit.rest.pulls.listReviews({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+
+  let reviewStates: PRApprovalStatus[] | null = reviews.data.map(review => ({
+    state: review.state,
+    reviewer: review.user?.login || ''
+  }));
+
+  if (reviewStates.length === 0) {
+    reviewStates = null;
+  }
+
+  return reviewStates;
+}
+
+async function fetchOpenPRsIntoReleaseBranch(owner: string, repo: string, releaseBranchPattern: string): Promise<void> {
+  const octokit = getOctokitSingleton()
+
+  try {
+    const { data: pullRequests } = await octokit.rest.pulls.list({
+      owner,
+      repo,
+      state: 'open',
+      base: releaseBranchPattern, // Assuming this is the name or pattern of your release branch
+    });
+
+    console.log(`\nOpen PRs targeting ${releaseBranchPattern}:`);
+    for (const pr of pullRequests) {
+      const reviews: PRApprovalStatus[] | null = await fetchPRApprovalStatus(owner, repo, pr.number);
+      console.log(`\n#${pr.number}: ${pr.title}\n  by ${pr.user?.login}\n  ${pr.html_url}${pr.draft ? '\n  ✏️✏️✏️ Draft ✏️✏️✏️' : ''}`);
+      if (reviews && reviews.length > 0) {
+        console.log('  Reviews:');
+        reviews.forEach(review => {
+          console.log(`    ${review.state} by ${review.reviewer}`);
+        });
+      } else if (!pr.draft) {
+        console.log('    ❗❗❗❗Needs reviews ❗❗❗❗');
+      }
+    }
+    console.log('\n_________________________');
+    console.log(`Currently there are ${pullRequests.length} open PRs targeting ${releaseBranchPattern}.`);
+  } catch (error) {
+    console.error(`Error fetching open PRs: ${error}`);
+  }
+  
+}
+
 async function printCommitsWithPRAndJiraLinks(repoGit: SimpleGit, pattern: string, repoUrl: string): Promise<void> {
 
   const { owner, repo } = extractOwnerAndRepo(repoUrl)
   const commits = await repoGit.log({
-    '--remotes': `origin/${pattern}`,
+    from: `origin/${pattern}`,
+    to: 'HEAD',
     '--pretty': 'format:%H %aI %D %s',
-    '--max-count': 100, // Limit the number of commits to 100
   });
-
-  console.log(`\n\nHere are the most recent commits on --remotes origin/${pattern}:`);
+  console.log(`\nHere are the most recent commits on ${pattern}:`);
 
   const prRegex = /#(\d+)/;
   const jiraIdRegex = /([a-zA-Z]+-\d{1,5})/gi;
@@ -159,12 +232,8 @@ async function printCommitsWithPRAndJiraLinks(repoGit: SimpleGit, pattern: strin
   let combined = new Set([...filteredAndConvertedJiraLinks, ...jiraLinks]);
   console.log('\nHere are the Jira links associated with the commits:');
   combined.forEach(link => {
-    console.log(`  Jira Link: ${link}`);
+    console.log(`  ${link}`);
   });
-  console.log('\nlet us know if you:')
-  console.log('- strongly feel we should cut a new build 🪓');
-  console.log('- strongly feel we should wait ⏳');
-
 }
 
 interface TagCommitDetails {
@@ -299,15 +368,23 @@ async function printCommitDetails(repo: SimpleGit, commitSha: string): Promise<v
 
 
 async function main() {
-  repoConfigs.forEach(async (config: RepoConfig) => {
+  for (const config of repoConfigs) {
+    console.log(`\n____Begin ${config.url}____`);
     const repo = await cloneAndFetch(config.url, config.localPath);
-    const recentCommits = await fetchRecentTagCommits(repo);
+    const recentCommits = await fetchRecentTagCommits(repo, 100); // Assuming fetchRecentTagCommits now accepts a limit parameter
     await printLatestTagsByCategory(recentCommits, config.tagRegex);
     await printLast5TagsWithDetails(repo);
     if (config.releaseBranchPattern) {
       await printCommitsWithPRAndJiraLinks(repo, config.releaseBranchPattern, config.url);
+      await fetchOpenPRsIntoReleaseBranch(extractOwnerAndRepo(config.url).owner, extractOwnerAndRepo(config.url).repo, config.releaseBranchPattern);
+      console.log(`\nhttps://github.com/Opentrons/opentrons/pulls?q=is%3Apr+is%3Aopen+base%3A${config.releaseBranchPattern}+`)
+      console.log('\nlet us know if you:')
+      console.log('🪓 strongly feel we should cut a new build 🪓');
+      console.log('⏳ strongly feel we should wait ⏳');
     }
-  });
+    console.log(`\n____Done with ${config.url}____`);
+  }
 }
+
 
 main();
