@@ -1,9 +1,36 @@
-import simpleGit, { SimpleGit, LogResult, BranchSummary, DefaultLogFields } from 'simple-git';
+import simpleGit, { SimpleGit, LogResult, BranchSummary, DefaultLogFields, TagResult } from 'simple-git';
 import { promises as fs } from 'fs';
-const git = simpleGit();
-const monorepoUrl = 'https://github.com/Opentrons/opentrons.git';
-const monorepoLocalPath = 'opentrons_repo';
-const monorepoTagRegex = /^(v|ot3|docs|components|protocol-designer)/;
+import { ExitCode } from '@actions/core';
+
+
+interface RepoConfig {
+  url: string;
+  localPath: string;
+  tagRegex: RegExp;
+  releaseBranchPattern?: string;
+}
+
+const repoConfigs: RepoConfig[] = [
+  {
+    url: 'https://github.com/Opentrons/opentrons.git',
+    localPath: 'opentrons_repo',
+    tagRegex: /^(v|ot3|docs|components|protocol-designer)/,
+    releaseBranchPattern: 'chore_release*',
+  },
+];
+
+async function cloneAndFetch(repoUrl: string, localPath: string): Promise<SimpleGit> {
+  if (!await checkDirectoryExists(localPath)) {
+    console.log(`Cloning ${repoUrl} into ${localPath}...`);
+    await simpleGit().clone(repoUrl, localPath);
+    console.log(`Repository cloned to ${localPath}.`);
+  }
+  const repoGit: SimpleGit = simpleGit(localPath); // Use the specific instance to work with the cloned repo
+  console.log('Fetching...');
+  await repoGit.fetch(['--all', '--tags', '--prune']);
+  console.log('Done fetching.');
+  return repoGit;
+}
 
 async function checkDirectoryExists(directoryPath: string): Promise<boolean> {
   try {
@@ -14,15 +41,13 @@ async function checkDirectoryExists(directoryPath: string): Promise<boolean> {
   }
 }
 
-async function printCommitsUntilTagFound(repoPath: string, pattern: string): Promise<string | undefined> {
-  const repo = simpleGit(repoPath);
-
+async function printCommitsUntilTagFound(repoGit: SimpleGit, pattern: string): Promise<string | undefined> {
   // Fetch commits from branches matching the pattern, ensuring they are in date order with from HEAD
-  const commits = await repo.log({
+  const commits = await repoGit.log({
     '--remotes': `origin/${pattern}`,
     '--pretty': 'format:%H %aI %D',
   });
-  console.log(`Printing commits until a tag matching origin/${pattern} is found...`);
+  console.log(`\nPrinting the most recent commits on --remotes origin/${pattern} until a tag is found:`);
 
   // Iterate through commits and print details
   for (const commit of commits.all) {
@@ -30,28 +55,15 @@ async function printCommitsUntilTagFound(repoPath: string, pattern: string): Pro
 
     // Check if the commit's refs include a tag
     if (commit.refs && /tag:/.test(commit.refs)) {
-      console.log('Tag found in commit refs, stopping.');
+      console.log('\nTag found in commit refs, stopping.');
       return commit.hash; // Return the commit hash if a tag is found
     }
   }
-
   // Return undefined if no tag is found
   return undefined;
 }
 
-async function cloneAndFetch(repoUrl: string, localPath: string): Promise<SimpleGit> {
-  if (!await checkDirectoryExists(localPath)) {
-    console.log(`Cloning ${repoUrl} into ${localPath}...`);
-    await git.clone(repoUrl, localPath); // Use the general instance to clone
-    console.log(`Repository cloned to ${localPath}.`);
-  }
-  const repoGit: SimpleGit = simpleGit(localPath); // Use the specific instance to work with the cloned repo
-  console.log('Fetching all and tags...');
-  await repoGit.fetch('--all'); // Fetch all branches
-  await repoGit.fetch('--tags'); // Fetch all tags
-  console.log('Fetched.');
-  return repoGit;
-}
+
 
 interface CommitDetails {
   sha: string;
@@ -59,77 +71,124 @@ interface CommitDetails {
   tags: string[]; // Include an array to store tags
 }
 
+interface TagCommitDetails {
+  sha: string;
+  date: string; // ISO format for easy sorting
+  tags: string[]; // All tags associated with this commit
+  message: string;
+  authorName: string;
+  authorEmail: string;
+}
 
-async function fetchRecentCommits(repoGit: SimpleGit, maxCommits: number = 5000): Promise<CommitDetails[]> {
-  // Custom format to include tags and other details in the log
-  const customFormat = {
-    hash: '%H', // Full commit hash
-    date: '%aI', // Author date, strict ISO 8601 format
-    refs: '%D', // Ref names, like the --decorate option of git-log
-    message: '%s', // Commit message
-    body: '%b', // Commit body
-    author_name: '%an', // Author name
-    author_email: '%ae' // Author email
-  };
-  // Fetch log with the custom format
-  const log: LogResult = await repoGit.log({ '--max-count': maxCommits, format: customFormat });
 
-  // Map each log entry to CommitDetails, including branches
-  return log.all.map(commit => {
-    const tags = commit.refs.split(', ')
-      .filter(ref => ref.startsWith('tag: '))
-      .map(tag => tag.replace('tag: ', ''));
+async function fetchRecentTagCommits(repoGit: SimpleGit, maxTags: number = 1000): Promise<TagCommitDetails[]> {
+  // Fetch the most recent 200 tags
+  const tagsFetch = await repoGit.tags(['--sort=-v:refname']);
+  const recentTags = tagsFetch.all.slice(0, maxTags);
 
-    return {
-      sha: commit.hash,
-      date: commit.date,
-      tags: tags,
-    };
+  const commitsMap = new Map<string, TagCommitDetails>();
+
+  for (const tagName of recentTags) {
+    // Fetch the commit SHA that the tag points to
+    const sha = await repoGit.revparse([`${tagName}^{commit}`]);
+    const delimiter = '|||';
+    // Now fetch the commit details using the SHA
+    const format = `%H${delimiter}%aI${delimiter}%an${delimiter}%ae${delimiter}%s`;
+    const commitDetails = await repoGit.show(['--no-patch', `--pretty=format:${format}`, sha]);
+
+    // Split details, trim each part, and filter out any empty lines
+    const [details, date, authorName, authorEmail, message] = commitDetails.trim().split(delimiter).filter(line => line);
+
+    if (commitsMap.has(sha)) {
+      // Append the tag to the tags array for existing commit
+      commitsMap.get(sha)?.tags.push(tagName);
+    } else {
+      // Add new entry to the map for new commit
+      commitsMap.set(sha, {
+        sha: sha,
+        date,
+        tags: [tagName],
+        message,
+        authorName,
+        authorEmail,
+      });
+    }
+  }
+  return Array.from(commitsMap.values());
+}
+
+
+async function printLast5TagsWithDetails(repoGit: SimpleGit): Promise<void> {
+  // Fetch all tags, including their metadata
+  const tagsFetch = await repoGit.tags(['--sort=-v:refname']);
+
+  // Get the last 5 tags
+  const last5Tags = tagsFetch.all.slice(0, 5);
+
+  console.log('\n--------------TAGS---------------------');
+  console.log('Processing the most recent 5 tags:');
+
+  for (const tagName of last5Tags) {
+    const format = '%(objecttype)|%(refname:short)|%(taggername)|%(taggeremail)|%(taggerdate:iso-strict)';
+    const tagRef = `refs/tags/${tagName}`;
+    const tagDetails = await repoGit.raw(['for-each-ref', `--format=${format}`, tagRef]);
+
+    console.log(`\nTag: ${tagName}`);
+    if (tagDetails.startsWith('tag')) {
+      // Annotated tag, print details
+      const [tagType, shortTagName, taggerName, taggerEmail, taggerDate] = tagDetails.split('|');
+      console.log(`Tagger: ${taggerName} <${taggerEmail}>`);
+      console.log(`Date: ${taggerDate.trimEnd()}`);
+      const shortMessage = await repoGit.raw(['tag', '-l', tagName, '--format=%(contents:subject)']);
+      console.log(`Message: ${shortMessage.trim()}`);
+    } else {
+      // Lightweight tag, print as a warning
+      console.warn(`Warning: '${tagName}' is a lightweight tag and does not contain additional metadata.`);
+    }
+  }
+}
+
+
+async function printLatestTagsByCategory(tagCommits: TagCommitDetails[], tagRegex: RegExp): Promise<void> {
+  // Initialize a map to hold arrays of the 3 most recent unique commits for each category
+  const mostRecentByCategory: Map<string, TagCommitDetails[]> = new Map();
+
+  for (const commit of tagCommits) {
+    for (const tag of commit.tags) {
+      const match = tag.match(tagRegex);
+      if (match) {
+        const category = match[0];
+        // Get the existing array of commits for this category, or initialize a new one
+        let existingCommits = mostRecentByCategory.get(category) || [];
+        
+        // Check if this commit is already included in the category
+        if (!existingCommits.some(c => c.sha === commit.sha)) {
+          // Add the current commit to the array if not already included
+          existingCommits = [...existingCommits, commit];
+          // Sort the array by date in descending order
+          existingCommits.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+          // Keep only the 3 most recent commits
+          mostRecentByCategory.set(category, existingCommits.slice(0, 3));
+        }
+      }
+    }
+  }
+
+  // Print the 3 most recent unique commits for each category
+  mostRecentByCategory.forEach((commits, category) => {
+    console.log(`\nCategory: ${category}`);
+    commits.forEach((commit, index) => {
+      console.log(`\nMost Recent Commit #${index + 1}:`);
+      console.log(`  SHA: ${commit.sha}`);
+      console.log(`  Date: ${commit.date}`);
+      console.log(`  Tags: ${commit.tags.join(', ')}`);
+      console.log(`  Author: ${commit.authorName} <${commit.authorEmail}>`);
+      console.log(`  Message: ${commit.message}`);
+    });
   });
 }
 
 
-
-async function printLatestTagsByCategory(commits: CommitDetails[], tagRegex: RegExp): Promise<void> {
-  const categoryTags: { [category: string]: CommitDetails[] } = {};
-
-  // Sort commits by date in descending order
-  const sortedCommits = commits.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-
-  // Use an async IIFE to process the commits and tags
-  await (async () => {
-    for (const commit of sortedCommits) {
-      for (const tag of commit.tags) {
-        const match = tag.match(tagRegex);
-        if (match) {
-          const category = match[0];
-          if (!categoryTags[category]) {
-            categoryTags[category] = [];
-          }
-          // Ensure only the latest 5 commits are kept per category
-          const isCommitAlreadyIncluded = categoryTags[category].some(storedCommit => storedCommit.sha === commit.sha);
-          if (!isCommitAlreadyIncluded && categoryTags[category].length < 5) {
-            categoryTags[category].push(commit);
-          }
-        }
-      }
-    }
-  })();
-
-
-
-  for (const [category, commits] of Object.entries(categoryTags)) {
-    console.log('--------------CATEGORY---------------------');
-    console.log(`\nCategory: ${category}, Latest 5 Commits:\n`);
-    commits.forEach(commit => {
-      console.log(`  SHA: ${commit.sha}`);
-      console.log(`  Date: ${commit.date}`);
-      console.log(`  Tags: ${commit.tags.join(', ')}`);
-      console.log('-----------------------------------'); // Separator for visual distinction
-    });
-  }
-
-}
 
 async function printCommitDetails(repo: SimpleGit, commitSha: string): Promise<void> {
   // Define a pretty format for the commit details
@@ -143,16 +202,19 @@ async function printCommitDetails(repo: SimpleGit, commitSha: string): Promise<v
 }
 
 
-
-
 async function main() {
-  const monorepoGit = await cloneAndFetch(monorepoUrl, monorepoLocalPath)
-  const recentCommits = await fetchRecentCommits(monorepoGit);
-  await printLatestTagsByCategory(recentCommits, monorepoTagRegex);
-  const commitWithTag = await printCommitsUntilTagFound(monorepoLocalPath, '*release*');
-  if (commitWithTag) {
-    await printCommitDetails(monorepoGit, commitWithTag);
-  }
+  repoConfigs.forEach(async (config: RepoConfig) => {
+    const repo = await cloneAndFetch(config.url, config.localPath);
+    const recentCommits = await fetchRecentTagCommits(repo);
+    await printLatestTagsByCategory(recentCommits, config.tagRegex);
+    if (config.releaseBranchPattern) {
+      const commitWithTag = await printCommitsUntilTagFound(repo, config.releaseBranchPattern);
+      if (commitWithTag) {
+        await printCommitDetails(repo, commitWithTag);
+      }
+    }
+    await printLast5TagsWithDetails(repo);
+  });
 }
 
 main();
